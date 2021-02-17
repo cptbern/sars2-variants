@@ -1,0 +1,973 @@
+---
+title: 'Outline: The windows of opportunity for drug therapy against SARS-CoV-2 infection'
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+  word_document: default
+editor_options:
+  chunk_output_type: inline
+---
+
+# setup
+```{r setup, include=F}
+library(deSolve)
+library(tidyverse)
+library(magrittr)
+library(mlxR)
+library(data.table)
+library(hrbrthemes)
+library(pkr)
+library(ggplot2)
+library(ggsci)
+library(gridExtra)
+library(gtable)
+
+# function to make word document out of data.frame
+df2word <- function(df, output_file = "table.doc", output_dir = ".", ...) {
+  f <- tempfile(fileext =".Rmd" )
+  cat(file = f, '```{r, echo = FALSE}
+                  knitr::kable(df)
+                 ```', append = TRUE)
+  rmarkdown::render(f, output_file = output_file, output_dir = output_dir, ...)
+  unlink(f)
+  file.path(output_dir, output_file)
+}
+```
+
+# Methods
+## Viral kinetics
+In the standard target cell limited model, an inoculum of virus particles *V* infects a pool of target cells *T* with rate *$\beta$*. Infected cells begin shedding virions at rate *p*. The parameters *c* and *$\delta$* determine the rate of loss for virus and cell death, respectively. We also considered an extension of this model in which infected cells enter an eclipse phase (*E*) for an average duration *$1/k$* until they begin shedding.
+
+The viral kinetics models predict absolute viral loads. The authors reported the cycle threshold (Ct) value from real time polymerase chain reaction (rtPCR) assays. As these vary by laboratory and analytical conditions,  we chose to correlate model output with observed Ct values with a regression model described by Chou et al., Clin Chem. 2020; 66: 549-555): Ct(load [log10]) = -3.502*load + 40.55
+
+```{r}
+Ct_viral_load <- function( Ct, viral_load ) {
+  if( missing(Ct) )
+    return (-3.502*viral_load+40.55)
+  
+  return( (Ct-40.55)/-3.502 )
+}
+
+Ct_viral_load( viral_load=3.0 )
+Ct_viral_load( Ct=30 )
+```
+
+Positivity in rtPCR was set at a Ct value of 35.
+
+"Detection of SARS-CoV-2 in Different Types of Clinical Specimens"
+Wenling Wang, PhD1; Yanli Xu, MD2; Ruqin Gao, MD3; et al Roujian Lu, MPH1; Kai Han, BS2; Guizhen Wu, MD1; Wenjie Tan, MD, PhD1
+Author Affiliations Article Information
+JAMA. 2020;323(18):1843-1844. doi:10.1001/jama.2020.3786 
+
+```{r}
+CT_LIMIT_OF_DETECTION <- 35
+```
+
+
+```{r echo=F, fig.width=5, fig.height=3}
+# manual fit
+IgG_RBD_To_EC50 <- 12 # days
+IgG_RBD_To_Emax <- 2.1 # IgG level
+IgG_RBD_To_Hill <- 8 # Hill coefficient
+IgG_RBD_To_max_eps <- 42 # maximum effect on viral clearance
+IgG_RBD_response <- data.frame( days = 0:60,
+                                IgG_RBD = ((0:60)^IgG_RBD_To_Hill)/(IgG_RBD_To_EC50^IgG_RBD_To_Hill+(0:60)^IgG_RBD_To_Hill))
+
+ggplot(IgG_RBD_response %>% filter(days<31), aes(days, IgG_RBD_To_Emax*IgG_RBD) ) + # scaled to optical densities reported
+  geom_line() + 
+  labs( title="Anti-RBD IgG production",
+        subtitle="Data: Lancet Infect Dis. 2020;20(5):565-574, Fig. 4",
+        x="Time [d]",
+        y="Optical density")
+#theme_ipsum_ps()
+```
+
+```{r}
+IgG_Long_EC50 <- 10.2 # days
+IgG_Long_Emax <- 104.6 
+IgG_Long_Hill <- 3.4 # Hill coefficient
+IgG_Long_max_eps <- 52 #from Nelder Mead #42 # maximum effect on viral clearance
+IgG_Long_response <- data.frame( days = 0:60,
+                                 IgG_Long = ((0:60)^IgG_Long_Hill)/(IgG_Long_EC50^IgG_Long_Hill+(0:60)^IgG_Long_Hill))
+
+ggplot(IgG_Long_response %>% filter(days<31), aes(days, IgG_Long_Emax*IgG_Long) ) + # scaled to optical densities reported
+  geom_line() + 
+  labs( title="Seroconversion",
+        subtitle="Data: Nat Med 26, 845–848 (2020)",
+        x="Time [d]",
+        y="Converted [%]")
+#theme_ipsum_rc()
+```
+
+
+## Pharmacokinetic models
+### IVM
+from Duthaler et al., 2020.
+
+####PK model
+```{r echo=F}
+ivmfood.model <- inlineModel("
+[INDIVIDUAL]
+input = { NN_pop, Mtt_pop, ka_pop, Cl_pop, V1_pop, Q_pop, V2_pop, F1_pop,
+          NN_sd, Mtt_sd, ka_sd, Cl_sd, V1_sd, Q_sd, V2_sd,
+          prop, add,
+          WT }
+
+EQUATION:
+covWT = log(WT) - 4.248495 ; centered on log(70)
+F1 = F1_pop
+
+DEFINITION:
+NN  = { distribution=lognormal, typical=NN_pop,   sd=NN_sd }
+Mtt = { distribution=lognormal, typical=Mtt_pop,  sd=Mtt_sd }
+ka  = { distribution=lognormal, typical=ka_pop,   sd=ka_sd }
+Cl  = { distribution=lognormal, typical=Cl_pop,   sd=Cl_sd,   covariate=covWT,  coefficient=0.75 }
+V1  = { distribution=lognormal, typical=V1_pop,   sd=V1_sd,   covariate=covWT,  coefficient=1 }
+Q   = { distribution=lognormal, typical=Q_pop,    sd=Q_sd }
+V2  = { distribution=lognormal, typical=V2_pop,   sd=V2_sd }
+
+[LONGITUDINAL]
+input = { NN, Mtt, ka, Cl, V1, Q, V2, F1, prop, add, WT}
+
+EQUATION:
+odeType = stiff
+ddt_AUC = 1/V1 * Ac
+
+; Parameter transformations 
+Ktr = (NN+1)/Mtt
+V = V1 
+k = Cl/V1 
+k12 = Q/V1 
+k21 = Q/V2
+
+; PK model definition
+PK:
+compartment(cmt=1, amount=Ac, volume=V)
+peripheral( k12, k21 )
+elimination( k )
+oral( cmt=1, ka, Mtt, Ktr, p=F1 )
+Cc = Ac / V
+
+OUTPUT:
+output = {Cc, y, AUC, WT}
+
+DEFINITION:
+y = {distribution=normal, prediction=Cc, errorModel=combined1(add, prop)}
+")
+
+ivmfood.params.fasted <- data.frame(
+  Cl_pop = 7.74, Cl_sd = sqrt(0.31), 
+  V1_pop = 100.8, V1_sd = sqrt(0.1),
+  V2_pop = 228.8, V2_sd = sqrt(0.21),
+  Q_pop = 18.67, Q_sd = sqrt(0.52),
+  ka_pop = 0.68, ka_sd = 0,
+  Mtt_pop = 0.93, Mtt_sd = sqrt(0.63),
+  NN_pop = 6, NN_sd = 0,
+  F1_pop = 0.84,
+  prop = 0.09, 
+  add = 0.82,
+  WT = 70
+)
+
+ivmfood.params.fed <- ivmfood.params.fasted %>% mutate(F1_pop=1)
+```
+
+
+```{r echo=F}
+##### 3x600 ug/kg, 70 kg
+set.seed(1234)
+
+study_h = 40*24
+study_n = 1 #length(covid.population$WT)
+study_tp = c(seq(0, study_h, by=1) )
+y <- list(name='y', time=study_tp )
+Cc <- list(name='Cc', time=study_tp )
+
+# typical patient -> no IIV
+covid.ivmfood.params <- data.frame(
+  id = 1,
+  Cl_pop = 7.74, Cl_sd = 0,
+  V1_pop = 100.8, V1_sd = 0,
+  V2_pop = 228.8, V2_sd = 0,
+  Q_pop = 18.67, Q_sd = 0,
+  ka_pop = 0.68, ka_sd = 0,
+  Mtt_pop = 0.93, Mtt_sd = 0,
+  NN_pop = 6, NN_sd = 0,
+  F1_pop = 1, # fed
+  prop = 0.09, 
+  add = 0.82,
+  WT = 70
+)
+
+adm  <- data.frame( id=1,
+                    amount=rep( 600*70, 3),
+                    time = c(0, 24, 48) )
+
+# n=sim_rep replicates of trial
+covid.sim.ivmfood.3x600.typical <- simulx( model = ivmfood.model,
+                                           output = list(Cc, y),
+                                           parameter = covid.ivmfood.params,
+                                           treatment = adm )
+
+ggplot(covid.sim.ivmfood.3x600.typical$Cc %>% 
+         dplyr::filter( time<7*24), aes(time, Cc)) +
+  geom_line() +
+  labs( title=sprintf("IVM 3x600 ug/kg typical individual"),
+        subtitle="Model: IVMFood (Duthaler, JAC 2020)",
+        x = "Time [h]",
+        y = "Concentration [ng/mL]") +
+  scale_x_continuous( breaks = (0:7)*24 )
+#theme_ipsum_ps() 
+```
+
+
+#### Mode of action
+```{r}
+IVM_MW <- 875.1 # g/mol, for conversion to uM
+
+LUNG_ACCUMULATION <- 2.6 # cattle lung accumulation, Ref: Lifschitz
+IVM_unbound_fraction <- (1-0.93) #93% of drug is protein bound
+
+nAChR_IC50_uM <- 156 / 1000 #https://www.nature.com/articles/srep42481
+nAChR_Hill <- 1
+
+# Helicase inhibition
+# Ref: J Antimicrob Chemother. 2012 Aug;67(8):1884-94.
+# doi: 10.1093/jac/dks147. Epub 2012 Apr 25. https://pubmed.ncbi.nlm.nih.gov/22535622/
+YFV_IC50_uM <- 0.12 # +/- 0.01
+DENV_IC50_uM <- 0.5 # +/- 0.07
+WNV_IC50_uM <- 0.35 # +/- 0.04
+HELICASE_IC50_uM <- 0.25 # estimate
+HELICASE_IC50_uM <- 0.1 # 10 fold higher IC50 in Vero, so 10 fold lower IC50 for helicase
+```
+
+```{r echo=F, fig.width=12, fig.height=5}
+# drug effects go here. First convert to uM, then relate to PK/PD behavior
+covid.sim.ivmfood.3x600.typical$Cc %<>% 
+  mutate( CC_umol = Cc / IVM_MW ) %>% 
+  mutate( eps_nAChR = CC_umol/(nAChR_IC50_uM+CC_umol),
+          eps_nAChR_lung = LUNG_ACCUMULATION*CC_umol/(nAChR_IC50_uM+LUNG_ACCUMULATION*CC_umol),
+          # eps_nAChR_unbound = IVM_unbound_fraction*CC_umol/ (nAChR_IC50_uM+CC_umol*IVM_unbound_fraction),
+          eps_nAChR_unbound = LUNG_ACCUMULATION*IVM_unbound_fraction*CC_umol/ (nAChR_IC50_uM+LUNG_ACCUMULATION*CC_umol*IVM_unbound_fraction),
+          eps_helicase = CC_umol/(HELICASE_IC50_uM+CC_umol),
+          eps_helicase_lung = LUNG_ACCUMULATION*CC_umol/(HELICASE_IC50_uM+LUNG_ACCUMULATION*CC_umol),
+          # eps_helicase_unbound = CC_umol*IVM_unbound_fraction/ (HELICASE_IC50_uM+CC_umol*IVM_unbound_fraction))
+          eps_helicase_unbound = LUNG_ACCUMULATION*CC_umol*IVM_unbound_fraction/ (HELICASE_IC50_uM+LUNG_ACCUMULATION*CC_umol*IVM_unbound_fraction))
+
+p.eps.nAChR <- ggplot( covid.sim.ivmfood.3x600.typical$Cc %>% 
+                         filter( time < 7*24 ), aes( time, eps_nAChR) ) +
+  geom_line() +
+  geom_line(aes(time, eps_nAChR_lung), linetype="dotted") +
+  geom_line(aes(time, eps_nAChR_unbound), linetype="dashed") +
+  labs( title=sprintf("IVM 3x600 ug/kg typical individual"),
+        subtitle="inhibitory effect on nAChR",
+        x = "Time [h]",
+        y = "Inhibition") +
+  scale_x_continuous( breaks = (0:7)*24 )
+#theme_ipsum_ps() 
+
+p.eps.helicase <- ggplot( covid.sim.ivmfood.3x600.typical$Cc %>% 
+                            filter( time < 7*24 ), aes( time, eps_helicase) ) +
+  geom_line() +
+  labs( title=sprintf("IVM 3x600 ug/kg typical individual"),
+        subtitle="inhibitory effect helicase",
+        x = "Time [h]",
+        y = "Inhibition (eps)") +
+  scale_x_continuous( breaks = (0:7)*24 )
+#theme_ipsum_ps() 
+
+gridExtra::grid.arrange(p.eps.nAChR, p.eps.helicase, nrow=1  )
+```
+
+
+# Results
+## Viral kinetics models
+### Target cell limited models
+
+### Nelder Mead estimated parameters
+from script Nelder_Mead_final.Rmd
+```{r}
+
+TIME_POSITIVITY <- 5.4*24 #days post infection
+TIME_PRESENTATION <- 10.2*24 #days post infection
+
+get_ode_states_parameters <- function(R0, immune_response="RBD_To" ) { 
+  c <- 5.07 #5.6 #Nelder Mead #3 # virus clearance
+  delta <- 0.54 #0.4 #Nelder Mead #0.8 # cell death
+  p <- 10.18 #9.6 #Nelder Mead #12 # viral production rate
+  I0 <- 0 # number of infected cells
+  T0 <- 1*10**5 # number of target cells
+  #R0 <- R0#3.79 # within-host reproduction number
+  V0 <- 1 #Nelder Mead #10**(-1) # initial load (inoculum)
+  
+  Immune_EC50 <- IgG_RBD_To_EC50 # days
+  Immune_Hill <- IgG_RBD_To_Hill # Hill coefficient
+  Immune_Emax <- IgG_RBD_To_max_eps # maximum effect on viral clearance
+  
+  if( immune_response == "Sero_Long" ) {
+    Immune_EC50 <- IgG_Long_EC50 # days
+    Immune_Hill <- IgG_Long_Hill # Hill coefficient
+    Immune_Emax <- IgG_Long_max_eps # maximum effect on viral clearance    
+  }
+  
+  beta <- c *delta*R0/((p-delta*R0)*T0)
+  
+  # ODE system parameterization
+  parameters <- c( c=c,
+                   delta=delta,
+                   p=p,
+                   R0=R0,
+                   beta=beta,
+                   T0 = T0, #VS: T0 added here, as otherwise error "T0 is missing"
+                   Immune_EC50=Immune_EC50,
+                   Immune_Emax=Immune_Emax,
+                   Immune_Hill=Immune_Hill)
+  
+  # ODE system initial conditions
+  state <- c( Tf = T0, # target cells
+              If = I0, # infected cells
+              Vf = V0 ) # viral load
+  
+  return( list(state=state, parameters=parameters))
+} 
+
+get_ode_states_parameters(R0=3.79)
+get_ode_states_parameters(R0=3.79,"RBD_To")
+get_ode_states_parameters(R0=3.79,"Sero_Long")
+```
+
+```{r echo=F}
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# model
+sars2_noeclipse <- function( t, state, parameters ) {  # function of time, state, parameters
+  with(as.list(c(state, parameters)),{ 
+    # rate of change
+    eps_inf <- input_inf(t)
+    eps_repro <- input_repro(t)
+    eps_acquired <- Immune_Emax * (t^Immune_Hill)/(Immune_EC50^Immune_Hill+t^Immune_Hill)
+    beta <- c*(1+eps_acquired)*delta*R0/((p-delta*R0)*T0) #FELIX: where does the p-delta*R0 come from?
+    # beta <- c*(1+eps_acquired)*delta*R0/(p*T0) #VS came to this formula. Anyways, should eps not be be between 0 and 1? Why is it 42
+    
+    dTf <-  - beta*(1-eps_inf)*Tf*Vf
+    dIf <-  + beta*(1-eps_inf)*Tf*Vf - delta*If
+    dVf <-  + p*(1-eps_repro)*If - c*(1+eps_acquired)*Vf - beta*(1-eps_inf)*Tf*Vf
+    # return rate of change
+    list(c(dTf, dIf, dVf))
+  })
+}
+
+# R0 as in Kern et al. 2020
+ode_settings <- get_ode_states_parameters(R0=3.79,immune_response = "Sero_Long")
+
+df.regular <- ode(y = ode_settings$state, 
+                  times = times, 
+                  func = sars2_noeclipse, 
+                  parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="R0")
+
+#R0 double
+ode_settings <- get_ode_states_parameters(R0=3.79*2, "Sero_Long")
+
+df.double <- ode(y = ode_settings$state, 
+                 times = times, 
+                 func = sars2_noeclipse, 
+                 parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="R0*2")
+
+#R0 half
+ode_settings <- get_ode_states_parameters(R0=3.79*0.75, "Sero_Long")
+
+df.threequarter <- ode(y = ode_settings$state, 
+                       times = times, 
+                       func = sars2_noeclipse, 
+                       parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="R0*0.75")
+
+#R0 quadruple
+ode_settings <- get_ode_states_parameters(R0=3.79*1.25, "Sero_Long")
+
+
+df.oneandquarter <- ode(y = ode_settings$state, 
+                        times = times, 
+                        func = sars2_noeclipse, 
+                        parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="R0*1.25")
+
+#R0 quadruple
+ode_settings <- get_ode_states_parameters(R0=3.79*1.5, "Sero_Long")
+
+
+df.oneandhalf <- ode(y = ode_settings$state, 
+                     times = times, 
+                     func = sars2_noeclipse, 
+                     parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="R0*1.5")
+```
+
+#### ** Summary plot
+```{r echo=F}
+ggplot( rbind(df.regular,
+              df.double,
+              df.threequarter,
+              df.oneandhalf,
+              df.oneandquarter) %>% filter(time<30 & Ct < 43), aes(time, Ct, group=group, color=group)) + #color=group, JAC was Black/White graphs
+  geom_hline( yintercept = CT_LIMIT_OF_DETECTION, linetype="dotted", color="black", size=.5 ) +
+  geom_line(size=1) +
+  scale_y_continuous( breaks=(0:10)*5, trans="reverse") + # flip y axis because low Ct values are bad
+  labs( color="",
+        linetype="",
+        x="Days post infection (dpi) [d]",
+        y="Viral load [Ct]") +
+  #theme_ipsum_ps() +
+  theme( legend.position = "bottom") +
+  scale_colour_manual(values = c( "R0"="black", "R0*2"="indianred3", "R0*1.5"="indianred2", "R0*1.25"="orange1", "R0*0.75"="royalblue3"))
+```
+
+#### ** Summary table natural history
+```{r}
+df.natural <- rbind(df.regular,
+                    df.double,
+                    df.threequarter,
+                    df.oneandhalf,
+                    df.oneandquarter) 
+
+df.natural.summary <- merge( 
+  df.natural %>% 
+    group_by(group) %>% 
+    filter( Ct < CT_LIMIT_OF_DETECTION ) %>% 
+    summarise( start_positivity = min(time),
+               duration = max(time)-min(time),
+               min_Ct = min(Ct)),
+  df.natural %>% 
+    group_by( group ) %>% 
+    summarise( AUC = LinAUC( x=time, y=Vf)["AUC"] ),
+  by="group")
+
+df.natural.summary
+```
+
+## Linking PK and viral kinetics (RGB_To)
+### Ivermectin 3x600 ug/kg
+#### Simulations
+
+```{r}
+time_offset <- seq.int(-48, 7*24, by =24 )
+```
+
+##### R0*1
+```{r}
+df.3x600.regular <- data.frame(time=numeric(),
+                               Tf=numeric(),
+                               If=numeric(),
+                               Vf=numeric(),
+                               Ct=numeric(),
+                               group=character()) 
+
+#time_offset = seq.int(-48, 120, by =1 )
+
+#Define R0 here!
+R0_mod=3.79
+
+for (i in 1:length(time_offset)){
+  
+  time_mod <- time_offset[i]
+  
+  ode_settings <- get_ode_states_parameters(R0=R0_mod, immune_response = "Sero_Long")
+  
+  times <- seq(0, 40, # number of days
+               by = .1) 
+  
+  input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+  
+  if (time_mod<=0){
+    df <- covid.sim.ivmfood.3x600.typical$Cc %>% 
+      filter(time>=abs (time_mod)) %>% 
+      mutate (time = time - abs(time_mod))
+  } else {
+    df <- covid.sim.ivmfood.3x600.typical$Cc %>% 
+      mutate (time = time +time_mod)
+    df <- rbind( data.frame( time=0, 
+                             Cc=0,
+                             CC_umol=0,
+                             eps_nAChR=0,
+                             eps_nAChR_lung=0,
+                             eps_nAChR_unbound=0,
+                             eps_helicase=0,
+                             eps_helicase_lung=0,
+                             eps_helicase_unbound=0),
+                 df )
+  }
+  
+  input_repro <- approxfun( df$time/24, df$eps_helicase_unbound) # effect of helicase suppression
+  input_inf <- approxfun( df$time/24, df$eps_nAChR_unbound) # effect of infectivity suppression
+  
+  b <- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times,
+           func = sars2_noeclipse,
+           parms = ode_settings$parameters) %>%
+    as.data.frame() %>%
+    mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+            group=paste (time_mod, " hours, R0*1", sep=""))
+  
+  df.3x600.regular <- rbind (b, df.3x600.regular)
+}
+```
+
+##### R0*0.75
+```{r}
+df.3x600.coadapt <- data.frame(time=numeric(),
+                               Tf=numeric(),
+                               If=numeric(),
+                               Vf=numeric(),
+                               Ct=numeric(),
+                               group=character()) 
+
+#Define R0 here!
+R0_mod=3.79*0.75
+
+for (i in 1:length(time_offset)){
+  
+  time_mod = time_offset[i]
+  
+  ode_settings <- get_ode_states_parameters(R0=R0_mod, immune_response = "Sero_Long")
+  
+  times <- seq(0, 40, # number of days
+               by = .1) 
+  
+  input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+  
+  if (time_mod<=0){
+    df <- covid.sim.ivmfood.3x600.typical$Cc %>% 
+      filter(time>=abs (time_mod)) %>% 
+      mutate (time = time - abs(time_mod))
+  } else {
+    df <- covid.sim.ivmfood.3x600.typical$Cc %>% 
+      mutate (time = time +time_mod)
+    df <- rbind( data.frame( time=0, 
+                             Cc=0,
+                             CC_umol=0,
+                             eps_nAChR=0,
+                             eps_nAChR_lung=0,
+                             eps_nAChR_unbound=0,
+                             eps_helicase=0,
+                             eps_helicase_lung=0,
+                             eps_helicase_unbound=0),
+                 df )
+  }
+  
+  input_repro <- approxfun( df$time/24, df$eps_helicase_unbound) # effect of helicase suppression
+  input_inf <- approxfun( df$time/24, df$eps_nAChR_unbound) # effect of infectivity suppression
+  
+  b   <- ode(y = ode_settings$state, #dbi days before inoculation
+             times = times,
+             func = sars2_noeclipse,
+             parms = ode_settings$parameters) %>%
+    as.data.frame() %>%
+    mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+            group=paste (time_mod, " hours, R0*0.75", sep=""))
+  
+  df.3x600.coadapt <- rbind (b, df.3x600.coadapt)
+  
+}
+```
+
+##### R0*1.25
+```{r}
+df.3x600.high_25 <- data.frame(time=numeric(),
+                               Tf=numeric(),
+                               If=numeric(),
+                               Vf=numeric(),
+                               Ct=numeric(),
+                               group=character()) 
+
+#Define R0 here!
+R0_mod=3.79*1.25
+
+for (i in 1:length(time_offset)){
+  
+  time_mod = time_offset[i]
+  
+  ode_settings <- get_ode_states_parameters(R0=R0_mod, immune_response = "Sero_Long")
+  
+  times <- seq(0, 40, # number of days
+               by = .1) 
+  
+  input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+  
+  if (time_mod<=0){
+    df <- covid.sim.ivmfood.3x600.typical$Cc %>% 
+      filter(time>=abs (time_mod)) %>% 
+      mutate (time = time - abs(time_mod))
+  } else {
+    df <- covid.sim.ivmfood.3x600.typical$Cc %>% 
+      mutate (time = time +time_mod)
+    df <- rbind( data.frame( time=0, 
+                             Cc=0,
+                             CC_umol=0,
+                             eps_nAChR=0,
+                             eps_nAChR_lung=0,
+                             eps_nAChR_unbound=0,
+                             eps_helicase=0,
+                             eps_helicase_lung=0,
+                             eps_helicase_unbound=0),
+                 df )
+  }
+  
+  input_repro <- approxfun( df$time/24, df$eps_helicase_unbound) # effect of helicase suppression
+  input_inf <- approxfun( df$time/24, df$eps_nAChR_unbound) # effect of infectivity suppression
+  
+  b   <- ode(y = ode_settings$state, #dbi days before inoculation
+             times = times,
+             func = sars2_noeclipse,
+             parms = ode_settings$parameters) %>%
+    as.data.frame() %>%
+    mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+            group=paste (time_mod, " hours, R0*1.25", sep=""))
+  
+  df.3x600.high_25 <- rbind (b, df.3x600.high_25)
+  
+}
+```
+
+##### R0*1.5
+```{r}
+df.3x600.high_50 <- data.frame(time=numeric(),
+                               Tf=numeric(),
+                               If=numeric(),
+                               Vf=numeric(),
+                               Ct=numeric(),
+                               group=character()) 
+
+#Define R0 here!
+R0_mod=3.79*1.5
+
+for (i in 1:length(time_offset)){
+  
+  time_mod = time_offset[i]
+  
+  ode_settings <- get_ode_states_parameters(R0=R0_mod, immune_response = "Sero_Long")
+  
+  times <- seq(0, 40, # number of days
+               by = .1) 
+  
+  input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+  
+  if (time_mod<=0){
+    df <- covid.sim.ivmfood.3x600.typical$Cc %>% 
+      filter(time>=abs (time_mod)) %>% 
+      mutate (time = time - abs(time_mod))
+  } else {
+    df <- covid.sim.ivmfood.3x600.typical$Cc %>% 
+      mutate (time = time +time_mod)
+    df <- rbind( data.frame( time=0, 
+                             Cc=0,
+                             CC_umol=0,
+                             eps_nAChR=0,
+                             eps_nAChR_lung=0,
+                             eps_nAChR_unbound=0,
+                             eps_helicase=0,
+                             eps_helicase_lung=0,
+                             eps_helicase_unbound=0),
+                 df )
+  }
+  
+  input_repro <- approxfun( df$time/24, df$eps_helicase_unbound) # effect of helicase suppression
+  input_inf <- approxfun( df$time/24, df$eps_nAChR_unbound) # effect of infectivity suppression
+  
+  b   <- ode(y = ode_settings$state, #dbi days before inoculation
+             times = times,
+             func = sars2_noeclipse,
+             parms = ode_settings$parameters) %>%
+    as.data.frame() %>%
+    mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+            group=paste (time_mod, " hours, R0*1.5", sep=""))
+  
+  df.3x600.high_50 <- rbind (b, df.3x600.high_50)
+  
+}
+```
+
+##### R0*2
+```{r}
+df.3x600.high_100 <- data.frame(time=numeric(),
+                                Tf=numeric(),
+                                If=numeric(),
+                                Vf=numeric(),
+                                Ct=numeric(),
+                                group=character()) 
+
+#Define R0 here!
+R0_mod=3.79*2
+
+for (i in 1:length(time_offset)){
+  
+  time_mod = time_offset[i]
+  
+  ode_settings <- get_ode_states_parameters(R0=R0_mod, immune_response = "Sero_Long")
+  
+  times <- seq(0, 40, # number of days
+               by = .1) 
+  
+  input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+  
+  if (time_mod<=0){
+    df <- covid.sim.ivmfood.3x600.typical$Cc %>% 
+      filter(time>=abs (time_mod)) %>% 
+      mutate (time = time - abs(time_mod))
+  } else {
+    df <- covid.sim.ivmfood.3x600.typical$Cc %>% 
+      mutate (time = time +time_mod)
+    df <- rbind( data.frame( time=0, 
+                             Cc=0,
+                             CC_umol=0,
+                             eps_nAChR=0,
+                             eps_nAChR_lung=0,
+                             eps_nAChR_unbound=0,
+                             eps_helicase=0,
+                             eps_helicase_lung=0,
+                             eps_helicase_unbound=0),
+                 df )
+  }
+  
+  input_repro <- approxfun( df$time/24, df$eps_helicase_unbound) # effect of helicase suppression
+  input_inf <- approxfun( df$time/24, df$eps_nAChR_unbound) # effect of infectivity suppression
+  
+  b   <- ode(y = ode_settings$state, #dbi days before inoculation
+             times = times,
+             func = sars2_noeclipse,
+             parms = ode_settings$parameters) %>%
+    as.data.frame() %>%
+    mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+            group=paste (time_mod, " hours, R0*2", sep=""))
+  
+  df.3x600.high_100 <- rbind (b, df.3x600.high_100)
+  
+}
+```
+
+####Summary
+##### Regular
+```{r echo=F}
+df.3x600.regular.summary <- rbind(df.regular %>% mutate(group="untreated R0*1"), 
+                                  df.3x600.regular) %>% 
+  filter(time<30)
+
+df.3x600.regular.summary <-merge( df.3x600.regular.summary %>% 
+                                    group_by( group ) %>% 
+                                    filter( Ct < CT_LIMIT_OF_DETECTION ) %>% 
+                                    summarise( start_positivity = min(time),
+                                               duration = max(time)-min(time),
+                                               min_Ct = min(Ct)),
+                                  df.3x600.regular.summary %>% 
+                                    group_by( group ) %>% 
+                                    summarise( AUC = LinAUC( x=time, y=Vf)["AUC"] ),
+                                  by="group" )
+
+df.3x600.regular.summary %<>%
+  mutate(start_pos_rel = start_positivity-start_positivity[group=="untreated R0*1"],
+         duration_rel = duration -duration[group=="untreated R0*1"],
+         min_Ct_rel = round(min_Ct / min_Ct[group=="untreated R0*1"],4),
+         AUC_rel = round(AUC / AUC[group=="untreated R0*1"],4))
+```
+##### R0*0.75
+
+```{r echo=F}
+df.3x600.coadapt.summary <- rbind(df.threequarter %>% mutate(group="untreated R0*0.75"), 
+                                  df.3x600.coadapt) %>% 
+  filter(time<30)
+
+df.3x600.coadapt.summary <-merge( df.3x600.coadapt.summary %>% 
+                                    group_by( group ) %>% 
+                                    filter( Ct < CT_LIMIT_OF_DETECTION ) %>% 
+                                    summarise( start_positivity = min(time),
+                                               duration = max(time)-min(time),
+                                               min_Ct = min(Ct)),
+                                  df.3x600.coadapt.summary %>% 
+                                    group_by( group ) %>% 
+                                    summarise( AUC = LinAUC( x=time, y=Vf)["AUC"] ),
+                                  by="group" )
+
+df.3x600.coadapt.summary %<>%
+  mutate(start_pos_rel = start_positivity-start_positivity[group=="untreated R0*0.75"],
+         duration_rel = duration -duration[group=="untreated R0*0.75"],
+         min_Ct_rel = round(min_Ct / min_Ct[group=="untreated R0*0.75"],4),
+         AUC_rel = round(AUC / AUC[group=="untreated R0*0.75"],4))
+```
+
+##### R0*1.25
+```{r echo=F}
+df.3x600.high_25.summary <- rbind(df.oneandquarter %>% mutate(group="untreated R0*1.25"), 
+                                  df.3x600.high_25) %>% 
+  filter(time<30)
+
+df.3x600.high_25.summary <-merge( df.3x600.high_25.summary %>% 
+                                    group_by( group ) %>% 
+                                    filter( Ct < CT_LIMIT_OF_DETECTION ) %>% 
+                                    summarise( start_positivity = min(time),
+                                               duration = max(time)-min(time),
+                                               min_Ct = min(Ct)),
+                                  df.3x600.high_25.summary %>% 
+                                    group_by( group ) %>% 
+                                    summarise( AUC = LinAUC( x=time, y=Vf)["AUC"] ),
+                                  by="group" )
+
+df.3x600.high_25.summary %<>%
+  mutate(start_pos_rel = start_positivity-start_positivity[group=="untreated R0*1.25"],
+         duration_rel = duration -duration[group=="untreated R0*1.25"],
+         min_Ct_rel = round(min_Ct / min_Ct[group=="untreated R0*1.25"],4),
+         AUC_rel = round(AUC / AUC[group=="untreated R0*1.25"],4))
+```
+
+##### R0*1.5
+```{r echo=F}
+df.3x600.high_50.summary <- rbind(df.oneandhalf %>% mutate(group="untreated R0*1.5"), 
+                                  df.3x600.high_50) %>% 
+  filter(time<30)
+
+df.3x600.high_50.summary <-merge( df.3x600.high_50.summary %>% 
+                                    group_by( group ) %>% 
+                                    filter( Ct < CT_LIMIT_OF_DETECTION ) %>% 
+                                    summarise( start_positivity = min(time),
+                                               duration = max(time)-min(time),
+                                               min_Ct = min(Ct)),
+                                  df.3x600.high_50.summary %>% 
+                                    group_by( group ) %>% 
+                                    summarise( AUC = LinAUC( x=time, y=Vf)["AUC"] ),
+                                  by="group" )
+
+df.3x600.high_50.summary %<>%
+  mutate(start_pos_rel = start_positivity-start_positivity[group=="untreated R0*1.5"],
+         duration_rel = duration -duration[group=="untreated R0*1.5"],
+         min_Ct_rel = round(min_Ct / min_Ct[group=="untreated R0*1.5"],4),
+         AUC_rel = round(AUC / AUC[group=="untreated R0*1.5"],4))
+```
+
+##### R0*2
+```{r echo=F}
+df.3x600.high_100.summary <- rbind(df.double %>% mutate(group="untreated R0*2"), 
+                                   df.3x600.high_100) %>% 
+  filter(time<30)
+
+df.3x600.high_100.summary <-merge( df.3x600.high_100.summary %>% 
+                                     group_by( group ) %>% 
+                                     filter( Ct < CT_LIMIT_OF_DETECTION ) %>% 
+                                     summarise( start_positivity = min(time),
+                                                duration = max(time)-min(time),
+                                                min_Ct = min(Ct)),
+                                   df.3x600.high_100.summary %>% 
+                                     group_by( group ) %>% 
+                                     summarise( AUC = LinAUC( x=time, y=Vf)["AUC"] ),
+                                   by="group" )
+
+df.3x600.high_100.summary %<>%
+  mutate(start_pos_rel = start_positivity-start_positivity[group=="untreated R0*2"],
+         duration_rel = duration -duration[group=="untreated R0*2"],
+         min_Ct_rel = round(min_Ct / min_Ct[group=="untreated R0*2"],4),
+         AUC_rel = round(AUC / AUC[group=="untreated R0*2"],4))
+
+```
+
+# ** Summary all
+```{r}
+df.sum.all <- rbind(df.3x600.regular.summary,
+                    df.3x600.coadapt.summary,
+                    df.3x600.high_25.summary,
+                    df.3x600.high_50.summary,
+                    df.3x600.high_100.summary)
+
+
+df.sum.all %<>%                
+  mutate(timing = (as.numeric (gsub( " .*$", "", group )))/24, #takes everything after space and replaces it with nothing
+         # ),
+         R0 = as.factor(round(as.numeric (gsub (".*\\*","", group)),2))) #takes everything before * and replaces it with nothing
+
+df.sum.all
+
+```
+
+## Grid plots
+```{r}
+p1 <- ggplot(df.sum.all %>% filter(timing!="untreated") %>% 
+               mutate(R0=paste("R0*", R0, sep="")),
+             aes(x=timing, y=duration_rel, group= R0, colour=R0)) +
+  geom_line(size=1) +
+  geom_hline(yintercept = 0, linetype="dashed", color="black") +
+  labs(title="Change in duration", 
+       x = "Treatment initiation [dpi]", 
+       y="Duration [days]",
+       color="") + 
+  #theme_ipsum_ps() + 
+  theme(legend.position = "bottom") +
+  scale_x_continuous(breaks=(-2:7)) +
+  scale_colour_manual(values = c( "R0*1"="black", "R0*2"="indianred3", "R0*1.5"="indianred2", "R0*1.25"="orange1", "R0*0.75"="royalblue3"))+
+  theme(text = element_text(size=15),
+        axis.text.x = element_text(size=11),
+        axis.text.y  = element_text(size=11),
+        axis.title.x = element_text(size=13),
+        axis.title.y = element_text(size=13))
+
+p2 <- ggplot(df.sum.all %>% filter(timing!="untreated") %>% 
+               mutate(R0=paste("R0*", R0, sep="")),
+             aes(x=timing, y=1-AUC_rel, group= R0, colour=R0)) +
+  geom_line(size=1) +
+  labs(title="Relative decrease in AUC", 
+       x = "Treatment initiation [dpi]", 
+       y="Change in AUC [%]",
+       color="") + 
+  #theme_ipsum_ps() + 
+  theme(legend.position = "bottom") +
+  scale_x_continuous(breaks=(-2:7)) +
+  scale_y_continuous(limits=c(0, .45), labels = scales::percent_format(accuracy = 1)) +
+  scale_colour_manual(values = c( "R0*1"="black", "R0*2"="indianred3", "R0*1.5"="indianred2", "R0*1.25"="orange1", "R0*0.75"="royalblue3"))+
+  theme(text = element_text(size=15),
+        axis.text.x = element_text(size=11),
+        axis.text.y  = element_text(size=11),
+        axis.title.x = element_text(size=13),
+        axis.title.y = element_text(size=13))
+
+
+p3 <- ggplot(df.sum.all %>% filter(timing!="untreated") %>% 
+               mutate(R0=paste("R0*", R0, sep="")),
+             aes(x=timing, y=min_Ct_rel, group= R0, colour=R0)) +
+  geom_line(size=1) +
+  labs(title="Change in peak Ct", 
+       x = "Treatment initiation [dpi]", 
+       y = "Cycles",
+       color="") + 
+  #theme_ipsum_ps() + 
+  theme(legend.position = "bottom") +
+  scale_x_continuous(breaks=(-2:7)) +
+  scale_colour_manual(values = c( "R0*1"="black", "R0*2"="indianred3", "R0*1.5"="indianred2", "R0*1.25"="orange1", "R0*0.75"="royalblue3"))
+
+
+p1
+p2
+p3 
+
+```
+
+```{r, fig.width=7, fig.height=3}
+
+g2 <- grid.arrange(p2+labs(title="a)"), p1+labs(title="b)"), #p3,
+                   ncol =2)  
+g2
+```
+
+
+
