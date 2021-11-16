@@ -1,0 +1,2948 @@
+---
+title: 'Effectiveness of antiviral therapy in highly-transmissible variants of SARS-CoV-2: a modeling and simulation study'
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup}
+library(tidyverse)
+library(deSolve)
+library(mlxR)
+library(pkr)
+library(ggplot2)
+library(hrbrthemes)
+```
+
+# Load simulated treatment
+```{r}
+mlnp.painter2021.sim.typical <- read.csv("data/mlnp.painter2021.sim.typical.csv")[-1]
+```
+
+# Setup
+```{r}
+Ct_viral_load <- function(Ct, viral_load) {
+  if(missing(Ct))
+    return (-3.502*viral_load+40.55)
+  return((Ct-40.55)/-3.502)
+}
+
+Ct_viral_load(viral_load=3.0)
+Ct_viral_load(Ct=30)
+```
+
+Positivity in RT-PCR was set at a Ct value of 35.
+```{r}
+CT_LIMIT_OF_DETECTION <- 35
+```
+
+## Immunity
+```{r}
+IgG_Long_EC50 <- 10.2 # days
+IgG_Long_Emax <- 104.6 
+IgG_Long_Hill <- 3.4 # Hill coefficient
+IgG_Long_max_eps <- 52 #from Nelder Mead #42 # maximum effect on viral clearance
+IgG_Long_response <- data.frame(days = 0:60, IgG_Long = ((0:60)^IgG_Long_Hill)/(IgG_Long_EC50^IgG_Long_Hill+(0:60)^IgG_Long_Hill))
+```
+
+
+# Molnupiravir pharmacokinetics model
+Paint et al., 2021 Antimicrob Agents Chemother. 2021 Mar 1;65(5):e02428-20. 
+doi: 10.1128/AAC.02428-20.
+
+```{r}
+
+molnupi.fig1.800.model <- inlineModel("
+[INDIVIDUAL]
+input = {Ktr_pop, Mtt_pop, ka_pop, V_pop, Cl_pop,
+         Ktr_sd,  Mtt_sd,  ka_sd,  V_sd,  Cl_sd}
+
+DEFINITION:
+Ktr = {distribution=lognormal, typical=Ktr_pop,  sd=Ktr_sd}
+Mtt = {distribution=lognormal, typical=Mtt_pop,  sd=Mtt_sd}
+ka  = {distribution=lognormal, typical=ka_pop,   sd=ka_sd}
+V   = {distribution=lognormal, typical=V_pop,    sd=V_sd}
+Cl  = {distribution=lognormal, typical=Cl_pop,   sd=Cl_sd}
+
+[LONGITUDINAL]
+input = {Ktr, Mtt, ka, V, Cl}
+
+EQUATION:
+odeType = stiff
+
+; PK model definition
+Cc = pkmodel(Ktr, Mtt, ka, V, Cl)
+
+OUTPUT:
+output = {Cc}
+")
+```
+
+```{r}
+MLNP_MW <- 329.31 # g/mol #https://pubchem.ncbi.nlm.nih.gov/compound/eidd-2801
+
+MLNP_unbound_fraction <- (1-0.133)*.164 #13.3% of drug plasma protein bound (van Prroijen 1977)
+#0.164 Cmax (ratio metabolite/parent drug) from mouse lung data Painter 2019
+
+MLNP_IC50_uM_Ros <- 0.4146 #uM (Rosenke 2021)
+```
+
+# Viral kinetics model
+Target cell limited model
+Nelder Mead estimated parameters
+
+## Model definition
+```{r}
+TIME_POSITIVITY <- 5.4*24 #days post infection
+TIME_PRESENTATION <- 10.2*24 #days post infection
+
+get_ode_states_parameters <- function(R0, immune_response="Sero_Long") { 
+  c <- 5.07 #5.6 #Nelder Mead #3 # virus clearance
+  delta <- 0.54 #0.4 #Nelder Mead #0.8 # cell death
+  p <- 10.18 #9.6 #Nelder Mead #12 # viral production rate
+  I0 <- 0 # number of infected cells
+  T0 <- 1*10**5 # number of target cells
+  V0 <- 1 #Nelder Mead #10**(-1) # initial load (inoculum)
+  
+  if(immune_response == "Sero_Long") {
+    Immune_EC50 <- IgG_Long_EC50 # days
+    Immune_Hill <- IgG_Long_Hill # Hill coefficient
+    Immune_Emax <- IgG_Long_max_eps # maximum effect on viral clearance    
+  }
+  
+  beta <- c*delta*R0/((p-delta*R0)*T0)
+
+  # ODE system parameterization
+  parameters <- c(c=c,
+                  delta=delta,
+                  p=p,
+                  R0=R0,
+                  beta=beta,
+                  T0 = T0, 
+                  Immune_EC50=Immune_EC50,
+                  Immune_Emax=Immune_Emax,
+                  Immune_Hill=Immune_Hill)
+  
+  # ODE system initial conditions
+  state <- c(Tf = T0, # target cells
+             If = I0, # infected cells
+             Vf = V0) # viral load
+  
+  return(list(state=state, parameters=parameters))
+} 
+
+```
+
+## Immunity model according to Long
+```{r echo=F}
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# model
+sars2_noeclipse <- function( t, state, parameters ) {  # function of time, state, parameters
+  with(as.list(c(state, parameters)),{ 
+    # rate of change
+    eps_inf <- input_inf(t)
+    eps_repro <- input_repro(t)
+    eps_acquired <- Immune_Emax * (t^Immune_Hill)/(Immune_EC50^Immune_Hill+t^Immune_Hill)
+    beta <- c*(1+eps_acquired)*delta*R0/((p-delta*R0)*T0)
+
+    dTf <-  - beta*(1-eps_inf)*Tf*Vf
+    dIf <-  + beta*(1-eps_inf)*Tf*Vf - delta*If
+    dVf <-  + p*(1-eps_repro)*If - c*(1+eps_acquired)*Vf - beta*(1-eps_inf)*Tf*Vf
+    # return rate of change
+    list(c(dTf, dIf, dVf))
+    })
+}
+
+# R0 as in Kern et al. 2020
+ode_settings <- get_ode_states_parameters(R0=3.79, immune_response = "Sero_Long")
+
+df.regular <- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="R0*1")
+
+#R0*2
+ode_settings <- get_ode_states_parameters(R0=3.79*2, "Sero_Long")
+
+df.double <- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="R0*2")
+
+#R0*0.75
+ode_settings <- get_ode_states_parameters(R0=3.79*0.75, "Sero_Long")
+
+df.threequarter <- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="R0*0.75")
+
+#R0*1.25
+ode_settings <- get_ode_states_parameters(R0=3.79*1.25, "Sero_Long")
+
+
+df.oneandquarter <- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="R0*1.25")
+
+#R0*1.5
+ode_settings <- get_ode_states_parameters(R0=3.79*1.5, "Sero_Long")
+
+
+df.oneandhalf <- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="R0*1.5")
+```
+
+#### Summary plot
+```{r echo=F, fig.height=5,fig.width=6}
+ggplot( rbind(df.regular,
+              df.double,
+              df.threequarter,
+              df.oneandhalf,
+              df.oneandquarter) %>% filter(time<30 & Ct < 43), aes(time, Ct, group=group, color=group)) +
+  geom_hline( yintercept = CT_LIMIT_OF_DETECTION, linetype="dotted", color="black", size=.5 ) +
+  geom_line(size=1) +
+  scale_y_continuous( breaks=(0:10)*5, trans="reverse") +
+  labs(color="",
+       linetype="",
+       x="Days post infection [dpi]",
+       y="Viral load [Ct]") +
+  theme( legend.position = "bottom") +
+  scale_colour_manual(values = c("R0*1"="black", "R0*2"="indianred3", "R0*1.5"="indianred2", "R0*1.25"="orange1", "R0*0.75"="royalblue3"))+
+  theme(legend.position = "bottom")
+```
+
+#### Summary table
+```{r}
+df.natural <- rbind(df.regular,
+              df.double,
+              df.threequarter,
+              df.oneandhalf,
+              df.oneandquarter) 
+
+df.natural.summary <- merge( 
+  df.natural %>% 
+    group_by(group) %>% 
+    filter(Ct < CT_LIMIT_OF_DETECTION) %>% 
+    summarise(start_positivity = min(time),
+               duration = max(time)-min(time),
+               min_Ct = min(Ct)),
+  df.natural %>% 
+    group_by(group) %>% 
+    summarise(AUC = LinAUC( x=time, y=Vf)["AUC"]),
+  by="group")
+
+df.natural.summary
+```
+
+## Molnupiravir 800mg every 12h for 5 days
+```{r}
+molnupi.fig1.800.params <- data.frame(
+  Ktr_pop = 2.01, Ktr_sd = 0,
+  Mtt_pop = 0.64, Mtt_sd = 0,
+  ka_pop = 2.01, ka_sd = 0,
+  V_pop = 0.052, V_sd = 0,
+  Cl_pop = 0.11, Cl_sd = 0
+)
+
+set.seed(1234)
+study_h = 40*24
+study_n = 1 
+study_tp = c(seq(0, study_h, by=0.1))
+Cc <- list(name='Cc', time=study_tp)
+
+adm10x800  <- list(amount=c(rep(800*1000)), # mg converted to ug
+                   time=c(0:9)*12 #every 12h for 5 days
+                   )
+
+# uncomment to rerun
+# mlnp.painter2021.sim.typical <- simulx(model=molnupi.fig1.800.model,
+#                                           output=list(Cc),
+#                                           parameter=molnupi.fig1.800.params,
+#                                           treatment=adm10x800)
+
+# effect on viral replication
+# mlnp.painter2021.sim.typical$Cc %<>% 
+#   mutate(CC_umol = Cc/MLNP_MW) %>% 
+#   mutate(eps_RdRp_Ros = CC_umol/(MLNP_IC50_uM_Ros+CC_umol),
+#          eps_RdRp_Ros_unbound = CC_umol*MLNP_unbound_fraction/(MLNP_IC50_uM_Ros+CC_umol*MLNP_unbound_fraction)
+#          )
+
+# mlnp.painter2021.sim.typical <- as.data.frame (mlnp.painter2021.sim.typical$Cc)
+
+```
+
+#### Dosing 3 days before inoculation
+##### Regular R0
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0 = 3.79, immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  filter(time>=72) %>%
+  mutate (time = time -72)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun(df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.3dbi.regular <- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 3 dbi, R0*1")
+
+ggplot( rbind(df.regular %>% mutate(group="untreated"), 
+              df.M10x800.3dbi.regular) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 3 days before inoculation, MLNP8, R0*1",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+
+```
+
+##### Threequarter R0 (0.75)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0 = 3.79*0.75, immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  filter(time>=72) %>% 
+  mutate (time = time -72)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.3dbi.threequarter <- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 3 dbi, R0*0.75")
+
+ggplot( rbind(df.threequarter %>% mutate(group="untreated"), 
+              df.M10x800.3dbi.threequarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 3 days before inoculation, MLNP8, R0*0.75",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+
+```
+
+##### Oneandquarter R0 (1.25)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0 = 3.79*1.25, immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  filter(time>=72) %>% 
+  mutate (time = time -72)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.3dbi.oneandquarter <- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 3 dbi, R0*1.25")
+
+ggplot( rbind(df.oneandquarter %>% mutate(group="untreated"), 
+              df.M10x800.3dbi.oneandquarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 3 days before inoculation, MLNP8, R0*1.25",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+
+```
+
+##### Oneandhalf R0 (1.5)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0 = 3.79*1.5, immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  filter(time>=72) %>% 
+  mutate (time = time -72)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.3dbi.oneandhalf <- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 3 dbi, R0*1.5")
+
+ggplot( rbind(df.oneandhalf  %>% mutate(group="untreated"), 
+              df.M10x800.3dbi.oneandhalf ) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 3 days before inoculation, MLNP8, R0*1.5",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+
+```
+
+##### Double R0 (2)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0 = 3.79*2, immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  filter(time>=72) %>% 
+  mutate (time = time -72)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.3dbi.double <- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 3 dbi, R0*2")
+
+ggplot( rbind(df.double  %>% mutate(group="untreated"), 
+              df.M10x800.3dbi.double  ) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 3 days before inoculation, MLNP8, R0*2",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+
+```
+
+#### Dosing 2 days before inoculation
+##### Regular R0
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79, immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  filter(time>=48) %>% 
+  mutate (time = time -48)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.2dbi.regular<- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated two dbi, R0*1")
+
+ggplot( rbind(df.regular %>% mutate(group="untreated"), 
+              df.M10x800.2dbi.regular) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 2 days before inoculation, MLNP8, R0*1",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+
+```
+
+##### Threequarter R0 (0.75)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*0.75, immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  filter(time>=48) %>% 
+  mutate (time = time -48)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.2dbi.threequarter<- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated two dbi, R0*0.75")
+
+ggplot( rbind(df.threequarter%>% mutate(group="untreated"), 
+              df.M10x800.2dbi.threequarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 2 days before inoculation, MLNP8, R0*0.75",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+
+```
+
+##### Oneandquarter R0 (1.25)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.25, immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  filter(time>=48) %>% 
+  mutate (time = time -48)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.2dbi.oneandquarter<- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated two dbi, R0*1.25")
+
+ggplot( rbind(df.oneandquarter%>% mutate(group="untreated"), 
+              df.M10x800.2dbi.oneandquarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 2 days before inoculation, MLNP8, R0*1.25",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+
+```
+
+##### Oneandhalf R0 (1.5)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.5, immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  filter(time>=48) %>% 
+  mutate (time = time -48)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.2dbi.oneandhalf<- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated two dbi, R0*1.5")
+
+ggplot( rbind(df.oneandhalf%>% mutate(group="untreated"), 
+              df.M10x800.2dbi.oneandhalf) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 2 days before inoculation, MLNP8, R0*1.5",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+
+```
+
+##### Double R0 (2)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*2, immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  filter(time>=48) %>% 
+  mutate (time = time -48)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.2dbi.double<- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated two dbi, R0*2")
+
+ggplot( rbind(df.double%>% mutate(group="untreated"), 
+              df.M10x800.2dbi.double) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 2 days before inoculation, MLNP8, R0*2",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+
+```
+
+
+#### Dosing 1 days before inoculation
+##### Regular R0
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  filter(time>=24) %>% 
+  mutate (time = time -24)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.1dbi.regular <- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 1 dbi, R0*1")
+
+ggplot( rbind(df.regular %>% mutate(group="untreated"), 
+              df.M10x800.1dbi.regular) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 1 days before inoculation, MLNP8, R0*1",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Threequarter R0 (0.75)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*0.75,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  filter(time>=24) %>% 
+  mutate (time = time -24)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.1dbi.threequarter <- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 1 dbi, R0*0.75")
+
+ggplot( rbind(df.threequarter  %>% mutate(group="untreated"), 
+              df.M10x800.1dbi.threequarter ) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 1 days before inoculation, MLNP8, R0*0.75",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+
+```
+
+##### Oneandquarter R0 (1.25)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.25,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  filter(time>=24) %>% 
+  mutate (time = time -24)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.1dbi.oneandquarter <- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 1 dbi, R0*1.25")
+
+ggplot( rbind(df.oneandquarter  %>% mutate(group="untreated"), 
+              df.M10x800.1dbi.oneandquarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 1 days before inoculation, MLNP8, R0*1.25",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandhalf R0 (1.5)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.5,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  filter(time>=24) %>% 
+  mutate (time = time -24)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.1dbi.oneandhalf <- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 1 dbi, R0*1.5")
+
+ggplot( rbind(df.oneandhalf   %>% mutate(group="untreated"), 
+              df.M10x800.1dbi.oneandhalf ) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 1 days before inoculation, MLNP8, R0*1.5",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Double R0 (2)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*2,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  filter(time>=24) %>% 
+  mutate (time = time -24)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.1dbi.double <- ode(y = ode_settings$state, #dbi days before inoculation
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 1 dbi, R0*2")
+
+ggplot( rbind(df.double  %>% mutate(group="untreated"), 
+              df.M10x800.1dbi.double) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 1 days before inoculation, MLNP8, R0*2",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+
+#### Dosing on inoculation
+##### Regular R0
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79, immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.on_exposure.regular<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated on exposure, R0*1")
+
+ggplot( rbind(df.regular%>% mutate(group="untreated"), 
+              df.M10x800.on_exposure.regular) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing on inoculation, MLNP8, R0*1",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Threequarter R0 (0.75)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*0.75,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.on_exposure.threequarter <- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated on exposure, R0*0.75")
+
+ggplot( rbind(df.threequarter %>% mutate(group="untreated"), 
+              df.M10x800.on_exposure.threequarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing on inoculation, MLNP8, R0*0.75",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandquarter R0 (1.25)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.25,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.on_exposure.oneandquarter<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated on exposure, R0*1.25")
+
+ggplot( rbind(df.oneandquarter %>% mutate(group="untreated"), 
+              df.M10x800.on_exposure.oneandquarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing on inoculation, MLNP8, R0*1.25",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+
+##### Oneandhalf R0 (1.5)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.5,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.on_exposure.oneandhalf <- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated on exposure, R0*1.5")
+
+ggplot( rbind(df.oneandhalf%>% mutate(group="untreated"), 
+              df.M10x800.on_exposure.oneandhalf) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing on inoculation, MLNP8, R0*1.5",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Double R0 (2)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*2, immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.on_exposure.double <- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated on exposure, R0*2")
+
+ggplot( rbind(df.double  %>% mutate(group="untreated"), 
+              df.M10x800.on_exposure.double ) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing on inoculation, MLNP8, R0*2",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+The intervention slightly delays the onset and reduces the duration of positivity, resulting in lower peak viral loads. More importantly, it reduces the total exposure of the host (AUC).
+
+```{r echo=F, eval=F}
+df <- rbind(df.regular %>% mutate(group="untreated"), 
+              df.M10x800.on_exposure.regular) %>% 
+  filter(time<30)
+
+merge( df %>% 
+         group_by( group ) %>% 
+         filter( Ct < CT_LIMIT_OF_DETECTION ) %>% 
+         summarise( start_positivity = min(time),
+                    duration = max(time)-min(time),
+                    min_Ct = min(Ct)),
+       df %>% 
+         group_by( group ) %>% 
+         summarise( AUC = LinAUC( x=time, y=Vf)["AUC"] ),
+       by="group" )
+```
+
+#### Dosing on 1dpi
+
+##### Regular R0
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 24 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.1dpi.regular<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 1 dpi, R0*1")
+
+ggplot( rbind(df.regular %>% mutate(group="untreated"), 
+              df.M10x800.1dpi.regular) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 1 dpi, MLNP8, R0*1",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Threequarter R0 (0.75)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*0.75,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 24 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.1dpi.threequarter<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 1 dpi, R0*0.75")
+
+ggplot( rbind(df.threequarter %>% mutate(group="untreated"), 
+              df.M10x800.1dpi.threequarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 1 dpi, MLNP8, R0*0.75",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandquarter R0 (1.25)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.25,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 24 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.1dpi.oneandquarter<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 1 dpi, R0*1.25")
+
+ggplot( rbind(df.oneandquarter %>% mutate(group="untreated"), 
+              df.M10x800.1dpi.oneandquarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 1 dpi, MLNP8, R0*1.25",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandhalf R0 (1.5)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.5,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 24 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.1dpi.oneandhalf<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 1 dpi, R0*1.5")
+
+ggplot( rbind(df.oneandhalf %>% mutate(group="untreated"), 
+              df.M10x800.1dpi.oneandhalf) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 1 dpi, MLNP8, R0*1.5",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Double R0 (2)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*2,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 24 ) 
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.1dpi.double<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 1 dpi, R0*2")
+
+ggplot( rbind(df.double %>% mutate(group="untreated"), 
+              df.M10x800.1dpi.double) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 1 dpi, MLNP8, R0*2",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+#### Dosing on 2dpi
+
+##### Regular R0
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 48 ) # shift right by 5d
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.2dpi.regular<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated two dpi, R0*1")
+
+ggplot( rbind(df.regular %>% mutate(group="untreated"), 
+              df.M10x800.2dpi.regular) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 2 dpi, MLNP8, R0*1",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Threequarter R0 (0.75)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*0.75,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 48 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.2dpi.threequarter<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated two dpi, R0*0.75")
+
+ggplot( rbind(df.threequarter %>% mutate(group="untreated"), 
+              df.M10x800.2dpi.threequarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 2 dpi, MLNP8, R0*0.75",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandquarter R0 (1.25)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.25,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 48 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.2dpi.oneandquarter<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated two dpi, R0*1.25")
+
+ggplot( rbind(df.oneandquarter %>% mutate(group="untreated"), 
+              df.M10x800.2dpi.oneandquarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 2 dpi, MLNP8, R0*1.25",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandhalf R0 (1.5)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.5,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 48 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.2dpi.oneandhalf<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated two dpi, R0*1.5")
+
+ggplot( rbind(df.oneandhalf %>% mutate(group="untreated"), 
+              df.M10x800.2dpi.oneandhalf) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 2 dpi, MLNP8, R0*1.5",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Double R0 (2)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*2,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 48)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.2dpi.double<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated two dpi, R0*2")
+
+ggplot( rbind(df.double %>% mutate(group="untreated"), 
+              df.M10x800.2dpi.double) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 2 dpi, MLNP8, R0*2",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+#### Dosing on 3dpi
+
+##### Regular R0
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 72 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.3dpi.regular<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 3 dpi, R0*1")
+
+ggplot( rbind(df.regular %>% mutate(group="untreated"), 
+              df.M10x800.3dpi.regular) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 3 dpi, MLNP8, R0*1",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Threequarter R0 (0.75)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*0.75,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 72 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.3dpi.threequarter<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 3 dpi, R0*0.75")
+
+ggplot( rbind(df.threequarter %>% mutate(group="untreated"), 
+              df.M10x800.3dpi.threequarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 3 dpi, MLNP8, R0*0.75",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandquarter R0 (1.25)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.25,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 72 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.3dpi.oneandquarter<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 3 dpi, R0*1.25")
+
+ggplot( rbind(df.oneandquarter %>% mutate(group="untreated"), 
+              df.M10x800.3dpi.oneandquarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 3 dpi, MLNP8, R0*1.25",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandhalf R0 (1.5)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.5,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 72 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.3dpi.oneandhalf<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 3 dpi, R0*1.5")
+
+ggplot( rbind(df.oneandhalf %>% mutate(group="untreated"), 
+              df.M10x800.3dpi.oneandhalf) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 3 dpi, MLNP8, R0*1.5",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Double R0 (2)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*2,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 72)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.3dpi.double<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 3 dpi, R0*2")
+
+ggplot( rbind(df.double %>% mutate(group="untreated"), 
+              df.M10x800.3dpi.double) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 3 dpi, MLNP8, R0*2",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+
+#### Dosing on 4dpi
+
+##### Regular R0
+
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 96 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.4dpi.regular<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 4 dpi, R0*1")
+
+ggplot( rbind(df.regular %>% mutate(group="untreated"), 
+              df.M10x800.4dpi.regular) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 4 dpi, MLNP8, R0*1",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Threequarter R0 (0.75)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*0.75,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 96 ) 
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.4dpi.threequarter<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 4 dpi, R0*0.75")
+
+ggplot( rbind(df.threequarter %>% mutate(group="untreated"), 
+              df.M10x800.4dpi.threequarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 4 dpi, MLNP8, R0*0.75",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandquarter R0 (1.25)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.25,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 96 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.4dpi.oneandquarter<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 4 dpi, R0*1.25")
+
+ggplot( rbind(df.oneandquarter %>% mutate(group="untreated"), 
+              df.M10x800.4dpi.oneandquarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 4 dpi, MLNP8, R0*1.25",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandhalf R0 (1.5)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.5,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 96 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.4dpi.oneandhalf<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 4 dpi, R0*1.5")
+
+ggplot( rbind(df.oneandhalf %>% mutate(group="untreated"), 
+              df.M10x800.4dpi.oneandhalf) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 4 dpi, MLNP8, R0*1.5",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Double R0 (2)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*2,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 96)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.4dpi.double<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 4 dpi, R0*2")
+
+ggplot( rbind(df.double %>% mutate(group="untreated"), 
+              df.M10x800.4dpi.double) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 4 dpi, MLNP8, R0*2",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+
+#### Dosing on positivity
+Here we assume subjects are dosed the same day they receive a positive test result.
+
+##### Regular R0
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + TIME_POSITIVITY )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.on_positivity.regular<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated on positivity, R0*1")
+
+ggplot( rbind(df.regular %>% mutate(group="untreated"), 
+              df.M10x800.on_positivity.regular) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing on positivity, MLNP8, R0*1",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Threequarter R0 (0.75)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*0.75,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + TIME_POSITIVITY )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.on_positivity.threequarter<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated on positivity, R0*0.75")
+
+ggplot( rbind(df.threequarter %>% mutate(group="untreated"), 
+              df.M10x800.on_positivity.threequarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing on positivity, MLNP8, R0*0.75",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandquarter R0 (1.25)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.25,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + TIME_POSITIVITY )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.on_positivity.oneandquarter<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated on positivity, R0*1.25")
+
+ggplot( rbind(df.oneandquarter %>% mutate(group="untreated"), 
+              df.M10x800.on_positivity.oneandquarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing on positivity, MLNP8, R0*1.25",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandhalf R0 (1.5)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.5,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + TIME_POSITIVITY )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.on_positivity.oneandhalf<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated on positivity, R0*1.5")
+
+ggplot( rbind(df.oneandhalf %>% mutate(group="untreated"), 
+              df.M10x800.on_positivity.oneandhalf) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing on positivity, MLNP8, R0*1.5",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Double R0 (2)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*2,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + TIME_POSITIVITY )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.on_positivity.double<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated on positivity, R0*2")
+
+ggplot( rbind(df.double %>% mutate(group="untreated"), 
+              df.M10x800.on_positivity.double) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing on positivity, MLNP8, R0*2",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+#### Dosing on 6dpi
+
+##### Regular R0
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 144 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.6dpi.regular<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 6 dpi, R0*1")
+
+ggplot( rbind(df.regular %>% mutate(group="untreated"), 
+              df.M10x800.6dpi.regular) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 6 dpi, MLNP8, R0*1",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Threequarter R0 (0.75)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*0.75,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 144 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.6dpi.threequarter<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 6 dpi, R0*0.75")
+
+ggplot( rbind(df.threequarter %>% mutate(group="untreated"), 
+              df.M10x800.6dpi.threequarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 6 dpi, MLNP8, R0*0.75",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandquarter R0 (1.25)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.25,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 144)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.6dpi.oneandquarter<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 6 dpi, R0*1.25")
+
+ggplot( rbind(df.oneandquarter %>% mutate(group="untreated"), 
+              df.M10x800.6dpi.oneandquarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 6 dpi, MLNP8, R0*1.25",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandhalf R0 (1.5)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.5,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 144)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.6dpi.oneandhalf<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 6 dpi, R0*1.5")
+
+ggplot( rbind(df.oneandhalf %>% mutate(group="untreated"), 
+              df.M10x800.6dpi.oneandhalf) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 6 dpi, MLNP8, R0*1.5",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Double R0 (2)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*2,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 144)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.6dpi.double<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 6 dpi, R0*2")
+
+ggplot( rbind(df.double %>% mutate(group="untreated"), 
+              df.M10x800.6dpi.double) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 6 dpi, MLNP8, R0*2",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+
+#### Dosing on 7dpi
+
+##### Regular R0
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 168)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.7dpi.regular<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 7 dpi, R0*1")
+
+ggplot( rbind(df.regular %>% mutate(group="untreated"), 
+              df.M10x800.7dpi.regular) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 7 dpi, MLNP8, R0*1",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Threequarter R0 (0.75)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*0.75,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 168 )
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.7dpi.threequarter<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 7 dpi, R0*0.75")
+
+ggplot( rbind(df.threequarter %>% mutate(group="untreated"), 
+              df.M10x800.7dpi.threequarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 7 dpi, MLNP8, R0*0.75",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandquarter R0 (1.25)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.25,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 168)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.7dpi.oneandquarter<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 7 dpi, R0*1.25")
+
+ggplot( rbind(df.oneandquarter %>% mutate(group="untreated"), 
+              df.M10x800.7dpi.oneandquarter) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 7 dpi, MLNP8, R0*1.25",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Oneandhalf R0 (1.5)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*1.5,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 168)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.7dpi.oneandhalf<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 7 dpi, R0*1.5")
+
+ggplot( rbind(df.oneandhalf %>% mutate(group="untreated"), 
+              df.M10x800.7dpi.oneandhalf) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 7 dpi, MLNP8, R0*1.5",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+##### Double R0 (2)
+```{r echo=F}
+ode_settings <- get_ode_states_parameters(R0=3.79*2,immune_response = "Sero_Long")
+
+times <- seq(0, 40, # number of days
+             by = .1) 
+
+input_inf <- input_cl <- input_repro <- function(x) return(0) # set all effects to 0 at any time
+
+# Molnupiravir 10x800mg treatment effect
+df <- mlnp.painter2021.sim.typical %>% 
+  mutate( time = time + 168)
+
+df <- rbind( data.frame( time=0, #add rows with zeros
+                         Cc=0,
+                         CC_umol=0,
+                         eps_RdRp_Ros=0,
+                         eps_RdRp_Ros_unbound=0),
+             df )
+
+input_repro <- approxfun( df$time/24, df$eps_RdRp_Ros_unbound) # effect of replication inhibition
+
+df.M10x800.7dpi.double<- ode(y = ode_settings$state, 
+           times = times, 
+           func = sars2_noeclipse, 
+           parms = ode_settings$parameters) %>% 
+  as.data.frame() %>% 
+  mutate( Ct = Ct_viral_load( viral_load=log(Vf,base=10) ),
+          group="MLNP8, treated 7 dpi, R0*2")
+
+ggplot( rbind(df.double %>% mutate(group="untreated"), 
+              df.M10x800.7dpi.double) %>% 
+          filter( time<25), aes(time, Ct, group=group, color=group)) +
+  geom_line( size=1) + 
+  scale_y_reverse() +
+  geom_hline( yintercept = 35, linetype="dashed", color="black") +
+  labs( title= "Within-host dynamics of SARS-CoV-2",
+        subtitle = "Dosing 7 dpi, MLNP8, R0*2",
+        x="Days post infection [dpi]",
+        y="Viral load [Ct]") +
+  theme_ipsum_ps()
+```
+
+
+####Summary
+#####Regular
+```{r echo=F}
+df.M8.sum.regular <- rbind(df.regular %>% mutate(group="untreated R0*1"), 
+            df.M10x800.2dbi.regular,
+            df.M10x800.3dbi.regular,
+            df.M10x800.1dbi.regular,
+            df.M10x800.on_exposure.regular,
+            df.M10x800.1dpi.regular,
+            df.M10x800.2dpi.regular,
+            df.M10x800.3dpi.regular,
+            df.M10x800.4dpi.regular,
+            df.M10x800.on_positivity.regular,
+            df.M10x800.6dpi.regular,
+            df.M10x800.7dpi.regular
+            ) %>% 
+  filter(time<30)
+
+df.M8.sum.regular <-merge( df.M8.sum.regular %>% 
+                      group_by( group ) %>% 
+                      filter( Ct < CT_LIMIT_OF_DETECTION ) %>% 
+                      summarise( start_positivity = min(time),
+                                 duration = max(time)-min(time),
+                                 min_Ct = min(Ct),
+                                 tmax = time[min(Ct)]),
+                    df.M8.sum.regular %>% 
+                      group_by( group ) %>% 
+                      summarise( AUC = LinAUC( x=time, y=Vf)["AUC"] ),
+                    by="group" )
+
+df.M8.sum.regular %<>%
+  mutate(start_pos_rel = start_positivity-start_positivity[group=="untreated R0*1"],
+         duration_rel = duration -duration[group=="untreated R0*1"],
+         min_Ct_rel = round(min_Ct / min_Ct[group=="untreated R0*1"],2),
+         AUC_rel = round(AUC / AUC[group=="untreated R0*1"],2))
+```
+#####Threequarter
+
+```{r echo=F}
+df.M8.sum.threequarter <- rbind(df.threequarter %>% mutate(group="untreated R0*0.75"), 
+            df.M10x800.2dbi.threequarter,
+            df.M10x800.3dbi.threequarter,
+            df.M10x800.1dbi.threequarter,
+            df.M10x800.on_exposure.threequarter,
+            df.M10x800.1dpi.threequarter,
+            df.M10x800.2dpi.threequarter,
+            df.M10x800.3dpi.threequarter,
+            df.M10x800.4dpi.threequarter,
+            df.M10x800.on_positivity.threequarter,
+            df.M10x800.6dpi.threequarter,
+            df.M10x800.7dpi.threequarter
+            ) %>% 
+  filter(time<30)
+
+df.M8.sum.threequarter <-merge( df.M8.sum.threequarter %>% 
+                      group_by( group ) %>% 
+                      filter( Ct < CT_LIMIT_OF_DETECTION ) %>% 
+                      summarise( start_positivity = min(time),
+                                 duration = max(time)-min(time),
+                                 min_Ct = min(Ct),
+                                 tmax = time[min(Ct)]),
+                    df.M8.sum.threequarter %>% 
+                      group_by( group ) %>% 
+                      summarise( AUC = LinAUC( x=time, y=Vf)["AUC"] ),
+                    by="group" )
+
+df.M8.sum.threequarter %<>%
+  mutate(start_pos_rel = start_positivity-start_positivity[group=="untreated R0*0.75"],
+         duration_rel = duration -duration[group=="untreated R0*0.75"],
+         min_Ct_rel = round(min_Ct / min_Ct[group=="untreated R0*0.75"],2),
+         AUC_rel = round(AUC / AUC[group=="untreated R0*0.75"],2))
+```
+
+#####Oneandquarter
+```{r echo=F}
+df.M8.sum.oneandquarter <- rbind(df.oneandquarter %>% mutate(group="untreated R0*1.25"), 
+            df.M10x800.2dbi.oneandquarter,
+            df.M10x800.3dbi.oneandquarter,
+            df.M10x800.1dbi.oneandquarter,
+            df.M10x800.on_exposure.oneandquarter,
+            df.M10x800.1dpi.oneandquarter,
+            df.M10x800.2dpi.oneandquarter,
+            df.M10x800.3dpi.oneandquarter,
+            df.M10x800.4dpi.oneandquarter,
+            df.M10x800.on_positivity.oneandquarter,
+            df.M10x800.6dpi.oneandquarter,
+            df.M10x800.7dpi.oneandquarter
+            ) %>% 
+  filter(time<30)
+
+df.M8.sum.oneandquarter <-merge( df.M8.sum.oneandquarter %>% 
+                      group_by( group ) %>% 
+                      filter( Ct < CT_LIMIT_OF_DETECTION ) %>% 
+                      summarise( start_positivity = min(time),
+                                 duration = max(time)-min(time),
+                                 min_Ct = min(Ct),
+                                 tmax = time[min(Ct)]),
+                    df.M8.sum.oneandquarter %>% 
+                      group_by( group ) %>% 
+                      summarise( AUC = LinAUC( x=time, y=Vf)["AUC"] ),
+                    by="group" )
+
+df.M8.sum.oneandquarter %<>%
+  mutate(start_pos_rel = start_positivity-start_positivity[group=="untreated R0*1.25"],
+         duration_rel = duration -duration[group=="untreated R0*1.25"],
+         min_Ct_rel = round(min_Ct / min_Ct[group=="untreated R0*1.25"],2),
+         AUC_rel = round(AUC / AUC[group=="untreated R0*1.25"],2))
+```
+
+#####oneandhalf
+```{r echo=F}
+df.M8.sum.oneandhalf <- rbind(df.oneandhalf %>% mutate(group="untreated R0*1.5"), 
+            df.M10x800.2dbi.oneandhalf,
+            df.M10x800.3dbi.oneandhalf,
+            df.M10x800.1dbi.oneandhalf,
+            df.M10x800.on_exposure.oneandhalf,
+            df.M10x800.1dpi.oneandhalf,
+            df.M10x800.2dpi.oneandhalf,
+            df.M10x800.3dpi.oneandhalf,
+            df.M10x800.4dpi.oneandhalf,
+            df.M10x800.on_positivity.oneandhalf,
+            df.M10x800.6dpi.oneandhalf,
+            df.M10x800.7dpi.oneandhalf
+            ) %>% 
+  filter(time<30)
+
+df.M8.sum.oneandhalf <-merge( df.M8.sum.oneandhalf %>% 
+                      group_by( group ) %>% 
+                      filter( Ct < CT_LIMIT_OF_DETECTION ) %>% 
+                      summarise( start_positivity = min(time),
+                                 duration = max(time)-min(time),
+                                 min_Ct = min(Ct),
+                                 tmax = time[min(Ct)]),
+                    df.M8.sum.oneandhalf %>% 
+                      group_by( group ) %>% 
+                      summarise( AUC = LinAUC( x=time, y=Vf)["AUC"] ),
+                    by="group" )
+
+df.M8.sum.oneandhalf %<>%
+  mutate(start_pos_rel = start_positivity-start_positivity[group=="untreated R0*1.5"],
+         duration_rel = duration -duration[group=="untreated R0*1.5"],
+         min_Ct_rel = round(min_Ct / min_Ct[group=="untreated R0*1.5"],2),
+         AUC_rel = round(AUC / AUC[group=="untreated R0*1.5"],2))
+```
+
+#####double
+```{r echo=F}
+df.M8.sum.double <- rbind(df.double %>% mutate(group="untreated R0*2"), 
+            df.M10x800.2dbi.double,
+            df.M10x800.3dbi.double,
+            df.M10x800.1dbi.double,
+            df.M10x800.on_exposure.double,
+            df.M10x800.1dpi.double,
+            df.M10x800.2dpi.double,
+            df.M10x800.3dpi.double,
+            df.M10x800.4dpi.double,
+            df.M10x800.on_positivity.double,
+            df.M10x800.6dpi.double,
+            df.M10x800.7dpi.double
+            ) %>% 
+  filter(time<30)
+
+df.M8.sum.double <-merge( df.M8.sum.double %>% 
+                      group_by( group ) %>% 
+                      filter( Ct < CT_LIMIT_OF_DETECTION ) %>% 
+                      summarise( start_positivity = min(time),
+                                 duration = max(time)-min(time),
+                                 min_Ct = min(Ct),
+                                 tmax = time[min(Ct)]),
+                    df.M8.sum.double %>% 
+                      group_by( group ) %>% 
+                      summarise( AUC = LinAUC( x=time, y=Vf)["AUC"] ),
+                    by="group" )
+
+df.M8.sum.double %<>%
+  mutate(start_pos_rel = start_positivity-start_positivity[group=="untreated R0*2"],
+         duration_rel = duration -duration[group=="untreated R0*2"],
+         min_Ct_rel = round(min_Ct / min_Ct[group=="untreated R0*2"],2),
+         AUC_rel = round(AUC / AUC[group=="untreated R0*2"],2))
+
+```
+
+#####Sum all
+```{r}
+df.M8.sum.all <- rbind(df.M8.sum.regular,
+                    df.M8.sum.threequarter,
+                    df.M8.sum.oneandquarter,
+                    df.M8.sum.oneandhalf,
+                    df.M8.sum.double)
+
+df.M8.sum.all %<>%                
+  mutate(timing = case_when(grepl("exposure", group) ~ "0",
+                            grepl("1 dbi", group) ~"-1",
+                            grepl("1 dpi", group) ~"1",
+                            grepl("two dbi", group) ~"-2",
+                            grepl("two", group) ~"2",
+                            grepl("3 dbi", group) ~"-3",
+                            grepl("3 dpi", group) ~"3",
+                            grepl("4 dpi", group) ~"4",
+                            grepl("positivity", group) ~ "5.4",
+                            grepl("6 dpi", group) ~ "6",
+                            grepl("7 dpi", group) ~"7",
+                            grepl("untreated", group) ~"untreated"
+                              ),
+           R0 = case_when(grepl("1.25", group) ~ "R0*1.25", 
+                                 grepl("2", group) ~ "R0*2", 
+                                 grepl("1.5", group) ~ "R0*1.5", 
+                                 grepl("0.75", group) ~ "R0*0.75", 
+                                 grepl ("1", group) ~ "R0*1"),
+         label = paste(R0,timing, sep=", ")) %>% 
+  mutate(timing = as.numeric(timing)) %>% 
+  mutate(AUC_prcnt=AUC_rel*100, AUC_rel_prcnt=(1-AUC_rel)*100)
+
+```
+
+#### Supplementary table
+```{r}
+# supplementary table
+df.M8.sum.all_table <- df.M8.sum.all %>%
+  mutate(min_Ct=round(min_Ct, digits=1), AUC=round(AUC, digits=0)) %>% 
+  select(group, R0, timing, start_positivity, duration, min_Ct, tmax, AUC, AUC_prcnt) %>% 
+  arrange(R0, timing)
+```
+
